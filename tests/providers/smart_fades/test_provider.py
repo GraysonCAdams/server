@@ -334,6 +334,41 @@ async def test_finalize_raises_when_not_enough_beats(provider: SmartFadesProvide
         await provider._finalize(session_id)
 
 
+async def test_finalize_skips_short_session(provider: SmartFadesProvider, mass_mock: Mock) -> None:
+    """_finalize skips a truncated session without invoking native beat inference."""
+    audio_format = AudioFormat(
+        content_type=ContentType.PCM_F32LE,
+        bit_depth=32,
+        sample_rate=44100,
+        channels=2,
+    )
+
+    stream_details = Mock()
+    stream_details.item_id = "test_short_session"
+    stream_details.provider = "test"
+    stream_details.queue_id = "test"
+    stream_details.uri = "test://short_session"
+    stream_details.media_type = MediaType.TRACK
+    stream_details.duration = 120
+
+    session_id = "test:test:test_short_session"
+    await provider.start_analysis(session_id, stream_details, audio_format)
+
+    # Feed only 3 seconds of audio, simulating a session whose stream ended
+    # right after start (e.g. interrupted by a seek)
+    pcm_data = FIXTURE_PCM.read_bytes()
+    chunk_size = 44100 * 2 * 4
+    for offset in range(0, 3 * chunk_size, chunk_size):
+        await provider.process_pcm_chunk(session_id, pcm_data[offset : offset + chunk_size])
+
+    with patch.object(provider, "_infer_beat_timings") as infer_mock:
+        result = await provider._finalize(session_id)
+
+    assert result is None
+    infer_mock.assert_not_called()
+    mass_mock.streams.audio_analysis.set_audio_analysis.assert_not_awaited()
+
+
 async def test_digital_silence_yields_finite_spectral_centroid(
     provider: SmartFadesProvider,
 ) -> None:

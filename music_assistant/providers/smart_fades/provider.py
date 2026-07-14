@@ -43,6 +43,14 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
 
 ANALYSIS_SAMPLE_RATE = 22050
+# Minimum amount of received audio for a session to be analyzable. Shorter segments are
+# truncated sessions (a stream that died right after start, or a seek-shortened tail),
+# not a property of the track: finalizing them would feed a near-empty spectrogram to
+# native (torch) beat inference, which cannot be guarded against once it crashes (a
+# divide-by-zero in native code raises SIGFPE and kills the whole process, it is not a
+# catchable Python exception). Crossfades are skipped for tracks shorter than this
+# anyway, so nothing meaningful is lost by refusing these segments.
+MIN_ANALYSIS_DURATION_SECONDS = 10.0
 
 
 @dataclass
@@ -236,6 +244,15 @@ class SmartFadesProvider(AudioAnalysisProvider):
 
         feats = np.concatenate(data.beats_feature_blocks, axis=0)
         duration = data.total_pcm_samples / ANALYSIS_SAMPLE_RATE
+
+        if duration < MIN_ANALYSIS_DURATION_SECONDS:
+            # skip without recording a failure, so the next full playthrough re-analyzes
+            self.logger.debug(
+                "Skipping smart fades analysis for %s: only %.1fs of audio received",
+                data.item_id,
+                duration,
+            )
+            return None
 
         # Prepare VQT features for key detection
         all_vqt = None
