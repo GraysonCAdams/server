@@ -129,9 +129,7 @@ class OvercastProvider(MusicProvider):
 
     @property
     def is_streaming_provider(self) -> bool:
-        """Return True if the provider is a streaming provider."""
-        # While the streams are remote, the library mirrors the user's own
-        # Overcast subscriptions, so this behaves like a local library provider.
+        """Return False: the library mirrors the user's own Overcast subscriptions."""
         return False
 
     async def get_library_podcasts(self) -> AsyncGenerator[Podcast]:
@@ -169,7 +167,7 @@ class OvercastProvider(MusicProvider):
             )
 
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
-        """Get Podcast."""
+        """Get the podcast for the given feed url."""
         parsed_podcast = await self._cache_get_podcast(prov_podcast_id)
         return parse_podcast(
             feed_url=prov_podcast_id,
@@ -210,7 +208,7 @@ class OvercastProvider(MusicProvider):
             yield mass_episode
 
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
-        """Get Podcast Episode."""
+        """Get a single podcast episode."""
         podcast_id, guid_or_stream_url = prov_episode_id.split(" ", 1)
         async for mass_episode in self.get_podcast_episodes(podcast_id):
             _, episode_key = mass_episode.item_id.split(" ", 1)
