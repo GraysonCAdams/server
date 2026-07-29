@@ -7,8 +7,8 @@ using the account's extended OPML export. Synchronization is strictly one-way
 deliberately not implemented and no state is ever written back.
 
 The OPML export endpoint is rate limited by Overcast, therefore the export is
-cached aggressively (stale-while-revalidate) and the RSS feeds referenced by it
-are fetched directly from the podcasts' own servers.
+cached aggressively and refreshed in the background, while the RSS feeds it
+refers to are fetched directly from the podcasts' own servers.
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ class OvercastProvider(MusicProvider):
         )
 
     async def get_podcast_episodes(self, prov_podcast_id: str) -> AsyncGenerator[PodcastEpisode]:
-        """Get Podcast episodes, decorated with Overcast playback state."""
+        """Get all episodes of a podcast, including their Overcast playback state."""
         podcast = await self._cache_get_podcast(prov_podcast_id)
         subscription = await self._get_subscription(prov_podcast_id)
         podcast_cover = podcast.get("cover_url")
@@ -325,7 +325,7 @@ class OvercastProvider(MusicProvider):
         try:
             subscriptions = await self._get_opml_subscriptions()
         except (ResourceTemporarilyUnavailable, LoginFailed) as err:
-            # progress decoration is best-effort; episodes still list without it
+            # episodes can still be listed without playback state
             self.logger.debug("Could not obtain Overcast playback states: %s", err)
             return None
         return subscriptions.get(feed_url)
