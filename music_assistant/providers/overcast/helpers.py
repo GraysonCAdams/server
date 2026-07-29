@@ -36,10 +36,7 @@ class OvercastSubscription:
 
 def parse_extended_opml(xml_text: str) -> dict[str, OvercastSubscription]:
     """
-    Parse Overcast's extended OPML export into subscriptions keyed by feed url.
-
-    Only feeds that are currently subscribed are returned; playlist outlines
-    and unsubscribed feeds are skipped.
+    Parse Overcast's extended OPML export into the subscribed feeds, keyed by feed url.
 
     :param xml_text: The raw OPML document as returned by the export endpoint.
     """
@@ -51,6 +48,7 @@ def parse_extended_opml(xml_text: str) -> dict[str, OvercastSubscription]:
     body = (document.get("opml") or {}).get("body") or {}
     subscriptions: dict[str, OvercastSubscription] = {}
     for group in body.get("outline", []):
+        # the export also contains a "playlists" group, only "feeds" is relevant
         if group.get("@text") != "feeds":
             continue
         for feed in group.get("outline", []):
