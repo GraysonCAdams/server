@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Placeholder icon: replace with the official Overcast asset before release. -->
+  <rect width="256" height="256" rx="56" fill="#FC7E0F"/>
+  <circle cx="128" cy="128" r="18" fill="#fff"/>
+  <path d="M88 168a56 56 0 0 1 0-80" fill="none" stroke="#fff" stroke-width="14" stroke-linecap="round"/>
+  <path d="M168 88a56 56 0 0 1 0 80" fill="none" stroke="#fff" stroke-width="14" stroke-linecap="round"/>
+  <path d="M62 194a92 92 0 0 1 0-132" fill="none" stroke="#fff" stroke-width="14" stroke-linecap="round" opacity="0.6"/>
+  <path d="M194 62a92 92 0 0 1 0 132" fill="none" stroke="#fff" stroke-width="14" stroke-linecap="round" opacity="0.6"/>
+</svg>
