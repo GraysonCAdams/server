@@ -288,9 +288,10 @@ class OvercastProvider(MusicProvider):
         cache_none=False,
     )
     async def _fetch_opml_text(self) -> str:
-        """Fetch the extended OPML export, re-logging in once on an expired session."""
+        """Fetch the account's extended OPML export."""
         opml_text = await self._request_opml()
         if opml_text is None:
+            # the session expired, log in again and retry once
             await self._login()
             opml_text = await self._request_opml()
             if opml_text is None:
@@ -298,7 +299,7 @@ class OvercastProvider(MusicProvider):
         return opml_text
 
     async def _request_opml(self) -> str | None:
-        """Request the OPML export once, or None when the session cookie was rejected."""
+        """Return the raw OPML document, or None if the session cookie was rejected."""
         try:
             async with self.http_session.get(OPML_EXPORT_URL, allow_redirects=False) as response:
                 if response.status == 200:
@@ -337,11 +338,9 @@ class OvercastProvider(MusicProvider):
         parsed_podcast: dict[str, Any],
     ) -> datetime | None:
         """
-        Propagate new Overcast playback states of a feed to the MA playlog.
+        Push a feed's new Overcast playback states to the playlog.
 
-        Only states updated after the persisted watermark are applied, so local
-        progress made since the previous sync is never overwritten. Returns the
-        newest timestamp that was applied, if any.
+        Returns the newest state timestamp that was applied, if any.
 
         :param feed_url: The podcast's feed url (also the provider item id).
         :param subscription: The Overcast subscription holding the episode states.
@@ -363,6 +362,8 @@ class OvercastProvider(MusicProvider):
                 # from an episode that simply was never touched in Overcast
                 continue
             if self._last_applied_ts is not None and state.user_updated_at <= self._last_applied_ts:
+                # already applied in a previous sync; skipping it also makes sure
+                # local progress made since then is not overwritten
                 continue
             mass_episode = parse_podcast_episode(
                 episode=parsed_episode,

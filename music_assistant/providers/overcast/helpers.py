@@ -79,15 +79,14 @@ def match_episode_state(
     """
     Find the Overcast playback state matching an episode's stream url.
 
-    Falls back to comparing urls with query and fragment stripped, as signed
-    CDN enclosure urls may rotate their query part between exports.
-
     :param subscription: The subscription holding the episode states.
     :param stream_url: The episode's enclosure/stream url from the RSS feed.
     """
     for state in subscription.episodes:
         if state.enclosure_url == stream_url:
             return state
+    # signed enclosure urls may rotate their query part between exports,
+    # so compare again with query and fragment stripped
     stripped_url = _strip_url(stream_url)
     for state in subscription.episodes:
         if state.enclosure_url and _strip_url(state.enclosure_url) == stripped_url:
