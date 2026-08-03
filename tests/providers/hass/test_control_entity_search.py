@@ -381,7 +381,7 @@ async def test_limit_caps_entities_and_reports_truncation() -> None:
 
     assert _entity_ids(limited["groups"]) == ["switch.kitchen_power", "media_player.living_amp"]
     assert limited["truncated"] is True
-    assert len(exact["groups"]) == 5
+    assert len(_entity_ids(exact["groups"])) == 5
     assert exact["truncated"] is False
 
 
