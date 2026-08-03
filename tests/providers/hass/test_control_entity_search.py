@@ -385,6 +385,18 @@ async def test_limit_caps_entities_and_reports_truncation() -> None:
     assert exact["truncated"] is False
 
 
+async def test_limit_cannot_be_raised_past_the_maximum() -> None:
+    """Cap what a caller can ask for, so no search can return an oversized response."""
+    with patch(
+        "music_assistant.providers.hass.control_entities.SEARCH_CONTROL_ENTITIES_MAX_LIMIT", 2
+    ):
+        async with _start_provider() as (provider, _):
+            result = await provider.search_control_entities(limit=1000)
+
+    assert _entity_ids(result["groups"]) == ["switch.kitchen_power", "media_player.living_amp"]
+    assert result["truncated"] is True
+
+
 async def test_consecutive_searches_share_one_state_sweep() -> None:
     """Sweep the Home Assistant states once and serve the next search from the cache."""
     async with _start_provider() as (provider, hass):

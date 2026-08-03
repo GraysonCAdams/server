@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from . import HomeAssistantProvider
 
 SEARCH_CONTROL_ENTITIES_LIMIT = 50
+# Ceiling on what a caller may raise the limit to, so a large Home Assistant setup can never
+# be asked for a response big enough to hurt, however the search is called.
+SEARCH_CONTROL_ENTITIES_MAX_LIMIT = 500
 # How long a search may reuse the control entity candidates of an earlier search. Resolving
 # them takes a full state sweep of Home Assistant, so a picker that searches while the user
 # types would otherwise sweep on every keystroke. The candidates carry entity, device and
@@ -123,7 +126,8 @@ class ControlEntitySearch:
         :param control_type: Restrict the result to entities that can serve this control role,
             given as one of the provider's control config keys (``power_controls``,
             ``volume_controls`` or ``mute_controls``). All roles are returned when omitted.
-        :param limit: Maximum number of entities (not groups) to return.
+        :param limit: Maximum number of entities (not groups) to return, itself capped at
+            ``SEARCH_CONTROL_ENTITIES_MAX_LIMIT``.
         :return: The matching entities grouped by the device and area they belong to, ordered
             by area, device and entity name, plus a flag telling whether matches were left out
             to honor the limit.
@@ -138,7 +142,7 @@ class ControlEntitySearch:
             matches = [match for match in matches if has_capability(match.entity)]
         if query := (search or "").casefold():
             matches = [match for match in matches if match.matches(query)]
-        limit = max(limit, 0)
+        limit = min(max(limit, 0), SEARCH_CONTROL_ENTITIES_MAX_LIMIT)
         groups: dict[tuple[str | None, str | None], HassControlEntityGroup] = {}
         for match in matches[:limit]:
             group_key = (match.device_id, match.area_id)

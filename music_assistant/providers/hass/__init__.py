@@ -445,7 +445,8 @@ class HomeAssistantProvider(PluginProvider):
         :param control_type: Restrict the result to entities that can serve this control role,
             given as one of the provider's control config keys (``power_controls``,
             ``volume_controls`` or ``mute_controls``). All roles are returned when omitted.
-        :param limit: Maximum number of entities (not groups) to return.
+        :param limit: Maximum number of entities (not groups) to return, itself capped at
+            ``SEARCH_CONTROL_ENTITIES_MAX_LIMIT``.
         :return: The matching entities grouped by the device and area they belong to, ordered
             by area, device and entity name, plus a flag telling whether matches were left out
             to honor the limit.
