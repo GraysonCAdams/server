@@ -16,18 +16,22 @@ from music_assistant.constants import CONF_LOG_LEVEL
 from music_assistant.helpers.api import APICommandHandler
 from music_assistant.providers.hass import (
     CONF_AUTH_TOKEN,
-    CONF_MUTE_CONTROLS,
-    CONF_POWER_CONTROLS,
     CONF_URL,
     CONF_VERIFY_SSL,
-    CONF_VOLUME_CONTROLS,
     SEARCH_CONTROL_ENTITIES_COMMAND,
-    HassControlEntityGroup,
-    HassControlEntitySearchResult,
     HomeAssistantProvider,
     setup,
 )
-from music_assistant.providers.hass.constants import MediaPlayerEntityFeature
+from music_assistant.providers.hass.constants import (
+    CONF_MUTE_CONTROLS,
+    CONF_POWER_CONTROLS,
+    CONF_VOLUME_CONTROLS,
+    MediaPlayerEntityFeature,
+)
+from music_assistant.providers.hass.control_entities import (
+    HassControlEntityGroup,
+    HassControlEntitySearchResult,
+)
 
 REGISTRY_LIST_COMMAND = "config/entity_registry/list_for_display"
 
@@ -441,7 +445,7 @@ async def test_entity_registry_change_forces_a_fresh_state_sweep() -> None:
 
 async def test_cached_candidates_expire() -> None:
     """Sweep again once the cached candidates have outlived their TTL."""
-    with patch("music_assistant.providers.hass.CONTROL_ENTITY_CACHE_TTL", 0):
+    with patch("music_assistant.providers.hass.control_entities.CONTROL_ENTITY_CACHE_TTL", 0):
         async with _start_provider() as (provider, hass):
             hass.state_requests.clear()
             await provider.search_control_entities()

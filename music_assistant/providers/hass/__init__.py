@@ -12,10 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
 from functools import partial
 from itertools import batched
-from typing import TYPE_CHECKING, Any, Final, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from hass_client import HomeAssistantClient
 from hass_client.exceptions import BaseHassClientError
@@ -30,7 +29,6 @@ from music_assistant_models.enums import (
     StreamType,
 )
 from music_assistant_models.errors import (
-    InvalidDataError,
     MusicAssistantError,
     SetupFailedError,
     UnsupportedFeaturedException,
@@ -45,14 +43,27 @@ from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.util import try_parse_int
 from music_assistant.models.plugin import AIEngine, PluginProvider, TTSEngine
 
-from .constants import OFF_STATES, MediaPlayerEntityFeature, parse_supported_features
+from .constants import (
+    CONF_MUTE_CONTROLS,
+    CONF_POWER_CONTROLS,
+    CONF_VOLUME_CONTROLS,
+    CONTROL_DOMAINS,
+    OFF_STATES,
+    MediaPlayerEntityFeature,
+    parse_supported_features,
+)
+from .control_entities import (
+    SEARCH_CONTROL_ENTITIES_LIMIT,
+    ControlEntitySearch,
+    HassControlEntitySearchResult,
+)
+from .helpers import ControlCapabilities, get_control_capabilities, get_control_name
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection
+    from collections.abc import Callable, Collection
 
     from aiohttp import ClientSession
     from hass_client.models import (
-        Area,
         CompressedState,
         Context,
         Device,
@@ -72,9 +83,6 @@ DOMAIN = "hass"
 CONF_URL = "url"
 CONF_AUTH_TOKEN = "token"
 CONF_VERIFY_SSL = "verify_ssl"
-CONF_POWER_CONTROLS = "power_controls"
-CONF_MUTE_CONTROLS = "mute_controls"
-CONF_VOLUME_CONTROLS = "volume_controls"
 FEATURE_DISCOVERY_TIMEOUT = 30
 STATE_FETCH_TIMEOUT = 30
 STATE_FETCH_BATCH_SIZE = 500
@@ -82,29 +90,11 @@ STATE_FETCH_BATCH_SIZE = 500
 # batch of entities results in a single rebuild of the engine lists
 ENGINE_REFRESH_DEBOUNCE = 2
 
-# Home Assistant entity domains Music Assistant can offer as player controls.
-CONTROL_DOMAINS = ("media_player", "switch", "input_boolean", "number", "input_number")
 # Home Assistant entity domains that back the TTS and AI Task features.
 FEATURE_DOMAINS = ("tts", "ai_task")
 FEATURE_DOMAIN_PREFIXES = tuple(f"{domain}." for domain in FEATURE_DOMAINS)
 
-# The entity domains worth inspecting for each control role. A superset is harmless: the
-# authoritative verdict comes from _get_control_capabilities on the entity's own state,
-# this only keeps the state sweep of a search away from domains that can never qualify.
-CONTROL_TYPE_DOMAINS: Final[dict[str, tuple[str, ...]]] = {
-    CONF_POWER_CONTROLS: ("media_player", "switch", "input_boolean"),
-    CONF_VOLUME_CONTROLS: ("media_player", "number", "input_number"),
-    CONF_MUTE_CONTROLS: ("media_player", "switch", "input_boolean"),
-}
 SEARCH_CONTROL_ENTITIES_COMMAND = f"{DOMAIN}/search_control_entities"
-SEARCH_CONTROL_ENTITIES_LIMIT = 50
-# How long a search may reuse the control entity candidates of an earlier search. Resolving
-# them takes a full state sweep of Home Assistant, so a picker that searches while the user
-# types would otherwise sweep on every keystroke. The candidates carry entity, device and
-# area names plus control capabilities - none of which change often, and none of which is
-# live entity state - so briefly serving a stale listing is harmless. A change to any of the
-# registries they build on drops the candidates right away rather than waiting this out.
-CONTROL_ENTITY_CACHE_TTL = 30
 
 
 class DeviceMediaPlayerInfo(TypedDict):
@@ -125,224 +115,6 @@ class HassRegistryEntity(TypedDict):
     area_id: str | None
 
 
-class HassControlEntity(TypedDict):
-    """A Home Assistant entity that can be used as a player control."""
-
-    entity_id: str
-    # the entity's friendly name, falling back to its entity ID when it has none
-    name: str
-    power: bool
-    volume: bool
-    mute: bool
-
-
-# Selects the entities that can serve each control role.
-CONTROL_TYPE_CAPABILITIES: Final[dict[str, Callable[[HassControlEntity], bool]]] = {
-    CONF_POWER_CONTROLS: lambda entity: entity["power"],
-    CONF_VOLUME_CONTROLS: lambda entity: entity["volume"],
-    CONF_MUTE_CONTROLS: lambda entity: entity["mute"],
-}
-
-
-class HassControlEntityGroup(TypedDict):
-    """The control entities of a single Home Assistant device."""
-
-    device_id: str | None
-    # None for entities that belong to no device, respectively to no area
-    device_name: str | None
-    area_name: str | None
-    entities: list[HassControlEntity]
-
-
-class HassControlEntitySearchResult(TypedDict):
-    """The outcome of a player control entity search."""
-
-    groups: list[HassControlEntityGroup]
-    # True when matches were left out to honor the requested limit
-    truncated: bool
-
-
-class _ControlCapabilities(NamedTuple):
-    """The player control roles a Home Assistant entity can serve."""
-
-    power: bool = False
-    volume: bool = False
-    mute: bool = False
-
-
-class _ControlEntityMatch(NamedTuple):
-    """A control entity together with the device and area it is presented under."""
-
-    device_id: str | None
-    device_name: str | None
-    area_id: str | None
-    area_name: str | None
-    entity: HassControlEntity
-
-    @property
-    def sort_key(self) -> tuple[bool, str, bool, str, str, str]:
-        """Return the ranking key, placing entities without an area or device last."""
-        return (
-            self.area_name is None,
-            (self.area_name or "").casefold(),
-            self.device_name is None,
-            (self.device_name or "").casefold(),
-            self.entity["name"].casefold(),
-            self.entity["entity_id"],
-        )
-
-    def matches(self, query: str) -> bool:
-        """
-        Return whether the given search text occurs in any of the searchable fields.
-
-        :param query: The case folded search text.
-        """
-        return any(
-            query in field.casefold()
-            for field in (
-                self.entity["entity_id"],
-                self.entity["name"],
-                self.device_name,
-                self.area_name,
-            )
-            if field
-        )
-
-
-class _RegistryCache[ItemT]:
-    """Cached Home Assistant registry listing that refreshes on the registry's update event."""
-
-    def __init__(
-        self,
-        event_type: str,
-        fetch: Callable[[], Awaitable[dict[str, ItemT]]],
-        subscribe: Callable[[Callable[[Event], None], str], Awaitable[Callable[[], None]]],
-    ) -> None:
-        """
-        Initialize the cache.
-
-        :param event_type: The Home Assistant event that signals a change to this registry.
-        :param fetch: Coroutine function returning the registry listing keyed by item ID.
-        :param subscribe: The Home Assistant client's event subscription method.
-        """
-        self._event_type = event_type
-        self._fetch = fetch
-        self._subscribe = subscribe
-        self._lock = asyncio.Lock()
-        self._items: dict[str, ItemT] | None = None
-        self._generation = 0
-        self._unsubscribe: Callable[[], None] | None = None
-
-    @property
-    def generation(self) -> int:
-        """Return a counter that changes whenever the cached listing is invalidated."""
-        return self._generation
-
-    async def get(self) -> dict[str, ItemT]:
-        """Return the registry listing, keyed by item ID."""
-        if (items := self._items) is not None:
-            return items
-        async with self._lock:
-            if self._unsubscribe is None:
-                # the subscription must be live before the first read, so no registry
-                # change can slip through unnoticed
-                self._unsubscribe = await self._subscribe(self._invalidate, self._event_type)
-            if (items := self._items) is None:
-                generation = self._generation
-                items = await self._fetch()
-                # a registry change while the fetch was in flight leaves the listing stale
-                # on arrival, so serve it to this caller but keep it out of the cache
-                if generation == self._generation:
-                    self._items = items
-            return items
-
-    def close(self) -> None:
-        """Drop the cached listing and stop watching for registry updates."""
-        if unsubscribe := self._unsubscribe:
-            self._unsubscribe = None
-            unsubscribe()
-        self._invalidate()
-
-    def _invalidate(self, _event: Event | None = None) -> None:
-        """Drop the cached listing."""
-        self._items = None
-        self._generation += 1
-
-
-class _ControlEntityCacheEntry(NamedTuple):
-    """Cached control entity candidates together with what makes them go stale."""
-
-    expires_at: float
-    generations: tuple[int, ...]
-    matches: list[_ControlEntityMatch]
-
-
-class _ControlEntityCache:
-    """
-    Short lived cache of the player control candidates, per set of entity domains.
-
-    Resolving the candidates takes a full state sweep of Home Assistant, by far the most
-    expensive part of a search, so consecutive searches reuse a single sweep.
-    """
-
-    def __init__(
-        self,
-        ttl: float,
-        generations: Callable[[], tuple[int, ...]],
-        resolve: Callable[[tuple[str, ...]], Awaitable[list[_ControlEntityMatch]]],
-    ) -> None:
-        """
-        Initialize the cache.
-
-        :param ttl: How long resolved candidates may be reused, in seconds.
-        :param generations: Returns the generations of the registries the candidates are built
-            from, so candidates resolved against an outdated registry are discarded.
-        :param resolve: Coroutine function resolving the candidates of the given domains.
-        """
-        self._ttl = ttl
-        self._generations = generations
-        self._resolve = resolve
-        self._lock = asyncio.Lock()
-        self._entries: dict[tuple[str, ...], _ControlEntityCacheEntry] = {}
-
-    async def get(self, domains: tuple[str, ...]) -> list[_ControlEntityMatch]:
-        """
-        Return the player control candidates found in the given entity domains.
-
-        :param domains: The entity domains to consider.
-        """
-        if (matches := self._lookup(domains)) is not None:
-            return matches
-        async with self._lock:
-            # a concurrent search may have resolved the same domains while this one waited
-            if (matches := self._lookup(domains)) is not None:
-                return matches
-            generations = self._generations()
-            matches = await self._resolve(domains)
-            # a registry change while the sweep was in flight leaves the candidates stale on
-            # arrival, so serve them to this caller but keep them out of the cache
-            if generations == self._generations():
-                self._entries[domains] = _ControlEntityCacheEntry(
-                    expires_at=time.monotonic() + self._ttl,
-                    generations=generations,
-                    matches=matches,
-                )
-            return matches
-
-    def clear(self) -> None:
-        """Drop all cached candidates."""
-        self._entries.clear()
-
-    def _lookup(self, domains: tuple[str, ...]) -> list[_ControlEntityMatch] | None:
-        """Return the cached candidates of the given domains, None when there are none left."""
-        if (entry := self._entries.get(domains)) is None:
-            return None
-        if entry.generations != self._generations() or entry.expires_at <= time.monotonic():
-            del self._entries[domains]
-            return None
-        return entry.matches
-
-
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
@@ -359,9 +131,9 @@ async def _get_config_entries(hass_prov: HomeAssistantProvider) -> tuple[ConfigE
         return ()
     states = await hass_prov.get_states(domains=CONTROL_DOMAINS)
     for state in states:
-        capabilities = _get_control_capabilities(state, hass_prov.logger)
+        capabilities = get_control_capabilities(state, hass_prov.logger)
         option = ConfigValueOption(
-            state["entity_id"], title=_get_control_name(state["entity_id"], state)
+            state["entity_id"], title=get_control_name(state["entity_id"], state)
         )
         if capabilities.power:
             all_power_entities.append(option)
@@ -419,11 +191,9 @@ class HomeAssistantProvider(PluginProvider):
     _entity_registry: dict[str, HassRegistryEntity] | None = None
     _entity_registry_generation: int = 0
     _entity_registry_lock: asyncio.Lock
-    _wanted_controls: dict[str, _ControlCapabilities] | None = None
+    _wanted_controls: dict[str, ControlCapabilities] | None = None
     _control_reconcile_lock: asyncio.Lock
-    _device_registry: _RegistryCache[Device]
-    _area_registry: _RegistryCache[Area]
-    _control_entity_cache: _ControlEntityCache
+    _control_entity_search: ControlEntitySearch
     _unregister_search_command: Callable[[], None] | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
@@ -530,17 +300,7 @@ class HomeAssistantProvider(PluginProvider):
         self.hass = HomeAssistantClient(url, token, http_session)
         self._entity_registry = None
         self._entity_registry_lock = asyncio.Lock()
-        self._device_registry = _RegistryCache(
-            "device_registry_updated", self._fetch_device_registry, self.hass.subscribe_events
-        )
-        self._area_registry = _RegistryCache(
-            "area_registry_updated", self._fetch_area_registry, self.hass.subscribe_events
-        )
-        self._control_entity_cache = _ControlEntityCache(
-            CONTROL_ENTITY_CACHE_TTL,
-            self._control_entity_generations,
-            self._resolve_control_entities,
-        )
+        self._control_entity_search = ControlEntitySearch(self)
         try:
             await self.hass.connect()
         except BaseHassClientError as err:
@@ -624,6 +384,11 @@ class HomeAssistantProvider(PluginProvider):
             "player_controls": len(self._player_controls) if self._player_controls else 0,
         }
 
+    @property
+    def entity_registry_generation(self) -> int:
+        """Return a counter that changes whenever the cached entity registry is invalidated."""
+        return self._entity_registry_generation
+
     async def get_entity_registry(self) -> dict[str, HassRegistryEntity]:
         """
         Return the Home Assistant entity registry, keyed by entity ID.
@@ -685,32 +450,7 @@ class HomeAssistantProvider(PluginProvider):
             by area, device and entity name, plus a flag telling whether matches were left out
             to honor the limit.
         """
-        if control_type is not None and control_type not in CONTROL_TYPE_DOMAINS:
-            msg = f"Invalid control type: {control_type}"
-            raise InvalidDataError(msg)
-        domains = CONTROL_DOMAINS if control_type is None else CONTROL_TYPE_DOMAINS[control_type]
-        matches = await self._control_entity_cache.get(domains)
-        if control_type is not None:
-            has_capability = CONTROL_TYPE_CAPABILITIES[control_type]
-            matches = [match for match in matches if has_capability(match.entity)]
-        if query := (search or "").casefold():
-            matches = [match for match in matches if match.matches(query)]
-        limit = max(limit, 0)
-        groups: dict[tuple[str | None, str | None], HassControlEntityGroup] = {}
-        for match in matches[:limit]:
-            group_key = (match.device_id, match.area_id)
-            if (group := groups.get(group_key)) is None:
-                group = HassControlEntityGroup(
-                    device_id=match.device_id,
-                    device_name=match.device_name,
-                    area_name=match.area_name,
-                    entities=[],
-                )
-                groups[group_key] = group
-            group["entities"].append(match.entity)
-        return HassControlEntitySearchResult(
-            groups=list(groups.values()), truncated=len(matches) > limit
-        )
+        return await self._control_entity_search.search(search, control_type, limit)
 
     async def get_media_player_device_infos(
         self,
@@ -1011,8 +751,8 @@ class HomeAssistantProvider(PluginProvider):
             power_controls = cast("list[str]", self.config.get_value(CONF_POWER_CONTROLS))
             mute_controls = cast("list[str]", self.config.get_value(CONF_MUTE_CONTROLS))
             volume_controls = cast("list[str]", self.config.get_value(CONF_VOLUME_CONTROLS))
-            wanted_controls: dict[str, _ControlCapabilities] = {
-                entity_id: _ControlCapabilities(
+            wanted_controls: dict[str, ControlCapabilities] = {
+                entity_id: ControlCapabilities(
                     power=entity_id in power_controls,
                     volume=entity_id in volume_controls,
                     mute=entity_id in mute_controls,
@@ -1042,7 +782,7 @@ class HomeAssistantProvider(PluginProvider):
         self,
         entity_id: str,
         hass_state: State | None,
-        capabilities: _ControlCapabilities,
+        capabilities: ControlCapabilities,
     ) -> PlayerControl:
         """
         Return a ready to use PlayerControl for a Home Assistant entity.
@@ -1055,7 +795,7 @@ class HomeAssistantProvider(PluginProvider):
         control = PlayerControl(
             id=entity_id,
             provider=self.instance_id,
-            name=_get_control_name(entity_id, hass_state),
+            name=get_control_name(entity_id, hass_state),
         )
         if capabilities.power:
             control.supports_power = True
@@ -1213,9 +953,7 @@ class HomeAssistantProvider(PluginProvider):
         if unsubscribe := self._unsubscribe_entity_registry:
             self._unsubscribe_entity_registry = None
             unsubscribe()
-        self._device_registry.close()
-        self._area_registry.close()
-        self._control_entity_cache.clear()
+        self._control_entity_search.close()
         if refresh_task := self._engine_refresh_task:
             self._engine_refresh_task = None
             refresh_task.cancel()
@@ -1349,114 +1087,6 @@ class HomeAssistantProvider(PluginProvider):
             )
             for entry in result["entities"]
         }
-
-    def _control_entity_generations(self) -> tuple[int, ...]:
-        """Return the generations of the registries the control entity candidates build on."""
-        return (
-            self._entity_registry_generation,
-            self._device_registry.generation,
-            self._area_registry.generation,
-        )
-
-    async def _resolve_control_entities(
-        self, domains: tuple[str, ...]
-    ) -> list[_ControlEntityMatch]:
-        """
-        Return the entities of the given domains that can serve as a player control.
-
-        :param domains: The entity domains to consider.
-        :return: The candidates in presentation order, each carrying every control role it
-            can serve plus the device and area it belongs to.
-        """
-        entity_registry = await self.get_entity_registry()
-        devices = await self._device_registry.get()
-        areas = await self._area_registry.get()
-        matches: list[_ControlEntityMatch] = []
-        for state in await self.get_states(domains=domains):
-            capabilities = _get_control_capabilities(state, self.logger)
-            if not any(capabilities):
-                continue
-            entity_id = state["entity_id"]
-            registry_entry = entity_registry.get(entity_id)
-            device_id = registry_entry["device_id"] if registry_entry else None
-            device = devices.get(device_id) if device_id else None
-            # Home Assistant lets an entity override the area it inherits from its device
-            area_id = (registry_entry["area_id"] if registry_entry else None) or (
-                device["area_id"] if device else None
-            )
-            matches.append(
-                _ControlEntityMatch(
-                    device_id=device_id,
-                    device_name=(device["name_by_user"] or device["name"]) if device else None,
-                    area_id=area_id,
-                    area_name=area["name"] if (area := areas.get(area_id or "")) else None,
-                    entity=HassControlEntity(
-                        entity_id=entity_id,
-                        name=state["attributes"].get("friendly_name") or entity_id,
-                        power=capabilities.power,
-                        volume=capabilities.volume,
-                        mute=capabilities.mute,
-                    ),
-                )
-            )
-        matches.sort(key=lambda match: match.sort_key)
-        return matches
-
-    async def _fetch_device_registry(self) -> dict[str, Device]:
-        """Fetch the device registry from Home Assistant, keyed by device ID."""
-        return {device["id"]: device for device in await self.hass.get_device_registry()}
-
-    async def _fetch_area_registry(self) -> dict[str, Area]:
-        """Fetch the area registry from Home Assistant, keyed by area ID."""
-        return {area["area_id"]: area for area in await self.hass.get_area_registry()}
-
-
-def _get_control_capabilities(state: State, logger: logging.Logger) -> _ControlCapabilities:
-    """
-    Return the player control roles the given Home Assistant entity can serve.
-
-    :param state: The current state of the entity to inspect.
-    :param logger: Logger to report an unparsable supported_features attribute on.
-    :return: The supported roles; all False when the entity is unusable as a player control.
-    """
-    entity_platform = state["entity_id"].split(".")[0]
-    if entity_platform in ("switch", "input_boolean"):
-        # simple on/off controls are suitable as power and mute controls
-        return _ControlCapabilities(power=True, mute=True)
-    if entity_platform in ("number", "input_number"):
-        # number and input_number are very similar, both are suitable for volume control
-        return _ControlCapabilities(volume=True)
-    # media player can be used as control, depending on features
-    if entity_platform != "media_player":
-        return _ControlCapabilities()
-    if "mass_player_type" in state["attributes"]:
-        # filter out mass players
-        return _ControlCapabilities()
-    supported_features = parse_supported_features(
-        state["attributes"].get("supported_features"),
-        state["entity_id"],
-        logger,
-    )
-    return _ControlCapabilities(
-        power=(
-            MediaPlayerEntityFeature.TURN_ON in supported_features
-            and MediaPlayerEntityFeature.TURN_OFF in supported_features
-        ),
-        volume=MediaPlayerEntityFeature.VOLUME_SET in supported_features,
-        mute=MediaPlayerEntityFeature.VOLUME_MUTE in supported_features,
-    )
-
-
-def _get_control_name(entity_id: str, state: State | None) -> str:
-    """
-    Return the human readable name to present a Home Assistant entity control under.
-
-    :param entity_id: The entity the control is based on.
-    :param state: The entity's current state, if known.
-    """
-    if state and (friendly_name := state["attributes"].get("friendly_name")):
-        return f"{friendly_name} ({entity_id})"
-    return entity_id
 
 
 def _decompress_state(entity_id: str, compressed_state: CompressedState) -> State:

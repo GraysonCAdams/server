@@ -17,16 +17,18 @@ from music_assistant_models.errors import SetupFailedError, UnsupportedFeaturedE
 from music_assistant.constants import CONF_LOG_LEVEL
 from music_assistant.providers.hass import (
     CONF_AUTH_TOKEN,
-    CONF_MUTE_CONTROLS,
-    CONF_POWER_CONTROLS,
     CONF_URL,
     CONF_VERIFY_SSL,
-    CONF_VOLUME_CONTROLS,
     STATE_FETCH_BATCH_SIZE,
     HomeAssistantProvider,
     setup,
 )
-from music_assistant.providers.hass.constants import MediaPlayerEntityFeature
+from music_assistant.providers.hass.constants import (
+    CONF_MUTE_CONTROLS,
+    CONF_POWER_CONTROLS,
+    CONF_VOLUME_CONTROLS,
+    MediaPlayerEntityFeature,
+)
 
 LAST_CHANGED = 1683832716.072648
 LAST_CHANGED_ISO = "2023-05-11T19:18:36.072648+00:00"
