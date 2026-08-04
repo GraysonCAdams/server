@@ -113,7 +113,8 @@ jobs:
             });
 
   report:
-    # Only report for runs triggered by pull requests
+    # Only report for runs triggered by pull requests, so a workflow_run whose
+    # originating event was a push/merge can never post a status.
     if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -125,6 +126,9 @@ jobs:
     steps:
       # Resolve the PR(s) and all trusted facts from the head commit. head_sha is
       # set by GitHub from the workflow_run event and cannot be forged by the PR.
+      # It is `workflow_run.head_sha` (the analysed PR head), NOT this run's own
+      # head_sha/head_branch — a workflow_run job is always stamped with the
+      # default branch tip, which is unrelated to the PR being reported on.
       # Commit statuses are per-SHA, so if several open PRs share this head
       # commit the gate must consider ALL of them (strictest result wins).
       - name: Resolve pull request (trusted)
@@ -415,6 +419,14 @@ jobs:
       # The commit status is per-SHA: when several open PRs share this head
       # commit, every PR must independently pass the gate (strictest wins), so
       # approval of one PR cannot greenlight another.
+      # The analysis workflow is path-filtered on `**/manifest.json`, so it also
+      # runs for PRs that touch a manifest without changing its `requirements`
+      # (a new provider, a metadata edit). Its scan covers the WHOLE installed
+      # environment from requirements_all.txt, so its findings then describe the
+      # base branch rather than the PR. Those findings must not gate such a PR:
+      # the no-dependency-changes case is decided first, before any scan-derived
+      # state, otherwise a pre-existing CVE in a pinned dependency posts a
+      # non-overridable 'error' that the PR author cannot act on.
       - name: Report security status
         if: always() && steps.resolve.outputs.found == 'true'
         uses: actions/github-script@v9
@@ -438,7 +450,12 @@ jobs:
             let state = 'success';
             let description = 'No dependency changes to review';
 
-            if (!analysisOk) {
+            if (!prs.some(p => p.deps_changed)) {
+              // Nothing to gate: the analysis ran only because of the path
+              // filter, and its environment-wide findings are not about any of
+              // these PRs. Leave the status as the init job seeded it.
+              core.info(`No dependency changes in ${prs.map(p => `#${p.number}`).join(', ')}; reporting success.`);
+            } else if (!analysisOk) {
               state = 'error';
               description = 'Dependency security analysis failed - re-run the Dependency Security Check workflow';
             } else if (!resultsPresent) {
@@ -459,7 +476,7 @@ jobs:
                 description = prs.length > 1
                   ? `Awaiting maintainer review on PR #${blocked.number} (add "dependencies-reviewed" label)`
                   : 'Awaiting maintainer review (add "dependencies-reviewed" label)';
-              } else if (prs.some(p => p.deps_changed)) {
+              } else {
                 state = 'success';
                 description = prs.every(p => !p.deps_changed || p.is_automated)
                   ? 'Automated dependency update - approved'
